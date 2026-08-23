@@ -1,0 +1,23 @@
+menu "MouseMove Configuration"
+
+    config MOUSE_DEVICE_NAME
+        string "Bluetooth device name"
+        default "ESP32-C3 MouseMove"
+        help
+            Name shown in the host's Bluetooth device list.
+
+    config MOUSE_MOVE_INTERVAL_SEC
+        int "Movement interval (seconds)"
+        range 1 3600
+        default 60
+        help
+            Time between automatic mouse movements after the first movement.
+
+    config MOUSE_MOVE_DISTANCE
+        int "Movement distance per step"
+        range 1 50
+        default 3
+        help
+            Relative X/Y movement in each side of the square pattern.
+
+endmenu

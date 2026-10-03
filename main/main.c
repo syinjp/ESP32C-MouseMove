@@ -18,12 +18,14 @@
 #include "esp_hid_common.h"
 #include "esp_hidd.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_adv.h"
 #include "host/ble_sm.h"
+#include "host/ble_store.h"
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -35,14 +37,19 @@
 #define HID_MOUSE_REPORT_ID              0
 #define HID_MOUSE_REPORT_LENGTH          4
 
-#define MOUSE_READY_BIT                  BIT0
+#if !defined(CONFIG_BT_NIMBLE_NVS_PERSIST) || !CONFIG_BT_NIMBLE_NVS_PERSIST
+#error "Enable CONFIG_BT_NIMBLE_NVS_PERSIST in menuconfig to retain pairing keys."
+#endif
+
+#define MOUSE_ENCRYPTED_BIT              BIT0
+#define MOUSE_HOST_ACTIVE_BIT            BIT1
+#define MOUSE_READY_BITS                 (MOUSE_ENCRYPTED_BIT | MOUSE_HOST_ACTIVE_BIT)
 
 static const char *TAG = "mouse_move";
 
 static esp_hidd_dev_t *s_hid_device;
 static EventGroupHandle_t s_mouse_events;
 static TimerHandle_t s_advertising_timer;
-static bool s_suspended;
 static uint8_t s_own_addr_type;
 
 /* Three buttons, relative X/Y movement, and a vertical wheel. */
@@ -99,8 +106,7 @@ static ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(HID_SERVICE_UUID);
 static bool mouse_is_ready(void)
 {
     return s_mouse_events != NULL &&
-           (xEventGroupGetBits(s_mouse_events) & MOUSE_READY_BIT) != 0 &&
-           !s_suspended &&
+           (xEventGroupGetBits(s_mouse_events) & MOUSE_READY_BITS) == MOUSE_READY_BITS &&
            s_hid_device != NULL &&
            esp_hidd_dev_connected(s_hid_device);
 }
@@ -170,13 +176,15 @@ static void mouse_move_task(void *arg)
 
     while (true) {
         xEventGroupWaitBits(s_mouse_events,
-                            MOUSE_READY_BIT,
+                            MOUSE_READY_BITS,
                             pdFALSE,
                             pdTRUE,
                             portMAX_DELAY);
 
         /* Make the first movement soon after pairing so operation is visible. */
         if (!wait_while_ready(3000)) {
+            /* Also yield if the asynchronous HID state is not ready yet. */
+            vTaskDelay(pdMS_TO_TICKS(250));
             continue;
         }
 
@@ -267,8 +275,51 @@ static void advertising_timer_callback(TimerHandle_t timer)
 static void schedule_advertising(void)
 {
     if (s_advertising_timer != NULL) {
-        xTimerReset(s_advertising_timer, 0);
+        if (xTimerReset(s_advertising_timer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Could not schedule advertising retry");
+        }
     }
+}
+
+static void log_bond_count(const char *stage)
+{
+    ble_addr_t peers[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int count = 0;
+    int rc = ble_store_util_bonded_peers(peers, &count, CONFIG_BT_NIMBLE_MAX_BONDS);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "Bond store (%s): %d/%d peers; NVS persistence enabled",
+                 stage, count, CONFIG_BT_NIMBLE_MAX_BONDS);
+    } else {
+        ESP_LOGW(TAG, "Reading bond count failed: rc=%d (0x%x)", rc, (unsigned)rc);
+    }
+}
+
+static void log_connection_state(const char *stage, const struct ble_gap_conn_desc *desc)
+{
+    const uint8_t *id = desc->peer_id_addr.val;
+    const uint8_t *ota = desc->peer_ota_addr.val;
+    /* Addresses identify the peer; never log bonding keys or key material. */
+    ESP_LOGI(TAG,
+             "%s: handle=%u peer_id=%02x:%02x:%02x:%02x:%02x:%02x(type=%u) "
+             "peer_ota=%02x:%02x:%02x:%02x:%02x:%02x(type=%u)",
+             stage, (unsigned)desc->conn_handle,
+             id[5], id[4], id[3], id[2], id[1], id[0], desc->peer_id_addr.type,
+             ota[5], ota[4], ota[3], ota[2], ota[1], ota[0], desc->peer_ota_addr.type);
+    ESP_LOGI(TAG, "Security: encrypted=%u bonded=%u authenticated=%u key_size=%u",
+             (unsigned)desc->sec_state.encrypted, (unsigned)desc->sec_state.bonded,
+             (unsigned)desc->sec_state.authenticated, (unsigned)desc->sec_state.key_size);
+}
+
+static void disconnect_for_security_recovery(uint16_t conn_handle)
+{
+    ESP_LOGW(TAG, "Ending unusable connection: handle=%u", (unsigned)conn_handle);
+    int rc = ble_gap_terminate(conn_handle, BLE_ERR_AUTH_FAIL);
+    if (rc == BLE_HS_ENOTCONN) {
+        schedule_advertising();
+    } else if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "Disconnect request failed: rc=%d (0x%x)", rc, (unsigned)rc);
+    }
+    /* A successful request resumes advertising from the GAP disconnect event. */
 }
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg)
@@ -276,36 +327,77 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
     (void)arg;
 
     switch (event->type) {
-    case BLE_GAP_EVENT_CONNECT:
+    case BLE_GAP_EVENT_CONNECT: {
         if (event->connect.status != 0) {
-            ESP_LOGW(TAG, "Connection attempt failed: %d", event->connect.status);
+            /* This SDK can report a raw HCI status from peer feature exchange. */
+            ESP_LOGW(TAG, "Connection completion failed: handle=%u status=%d (0x%x)",
+                     (unsigned)event->connect.conn_handle, event->connect.status,
+                     (unsigned)event->connect.status);
             schedule_advertising();
             break;
         }
 
-        ESP_LOGI(TAG, "BLE connection established");
-        {
-            int rc = ble_gap_security_initiate(event->connect.conn_handle);
-            if (rc != 0 && rc != BLE_HS_EALREADY) {
-                ESP_LOGW(TAG, "Starting security failed: %d", rc);
+        struct ble_gap_conn_desc desc;
+        int rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "Connected link no longer available: rc=%d (0x%x)", rc, (unsigned)rc);
+            break;
+        }
+        log_connection_state("BLE connected", &desc);
+        xEventGroupSetBits(s_mouse_events, MOUSE_HOST_ACTIVE_BIT);
+
+        /* Peer-initiated encryption may finish before this delayed CONNECT event. */
+        if (desc.sec_state.encrypted) {
+            xEventGroupSetBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+            break;
+        }
+        xEventGroupClearBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+        rc = ble_gap_security_initiate(event->connect.conn_handle);
+        if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_ENOTCONN) {
+            ESP_LOGW(TAG, "Starting security failed: rc=%d (0x%x)", rc, (unsigned)rc);
+            disconnect_for_security_recovery(event->connect.conn_handle);
+        }
+        break;
+    }
+
+    case BLE_GAP_EVENT_ENC_CHANGE: {
+        if (event->enc_change.status == 0) {
+            struct ble_gap_conn_desc desc;
+            int rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
+            if (rc == 0) {
+                log_connection_state("Security changed", &desc);
+                if (desc.sec_state.encrypted) {
+                    xEventGroupSetBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+                    log_bond_count("encrypted");
+                    break;
+                }
+                xEventGroupClearBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+                disconnect_for_security_recovery(event->enc_change.conn_handle);
+            } else {
+                xEventGroupClearBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+            }
+        } else {
+            xEventGroupClearBits(s_mouse_events, MOUSE_ENCRYPTED_BIT);
+            if (event->enc_change.status == BLE_HS_ENOTCONN) {
+                ESP_LOGI(TAG, "Security procedure ended because the link disconnected");
+            } else {
+                ESP_LOGW(TAG, "Security failed: handle=%u status=%d (0x%x)",
+                         (unsigned)event->enc_change.conn_handle, event->enc_change.status,
+                         (unsigned)event->enc_change.status);
+                /* Includes the NimBLE SMP timeout; do not keep the only link occupied. */
+                disconnect_for_security_recovery(event->enc_change.conn_handle);
             }
         }
         break;
-
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        if (event->enc_change.status == 0) {
-            ESP_LOGI(TAG, "Encrypted and bonded; mouse is ready");
-            xEventGroupSetBits(s_mouse_events, MOUSE_READY_BIT);
-        } else {
-            ESP_LOGW(TAG, "Encryption failed: %d", event->enc_change.status);
-            xEventGroupClearBits(s_mouse_events, MOUSE_READY_BIT);
-        }
-        break;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT:
-        xEventGroupClearBits(s_mouse_events, MOUSE_READY_BIT);
-        s_suspended = false;
-        ESP_LOGI(TAG, "BLE disconnected: %d", event->disconnect.reason);
+        xEventGroupClearBits(s_mouse_events, MOUSE_READY_BITS);
+        log_connection_state("BLE disconnected", &event->disconnect.conn);
+        ESP_LOGI(TAG, "Disconnect reason=%d (0x%x)", event->disconnect.reason,
+                 (unsigned)event->disconnect.reason);
+        /* Also covers links that ended before the HID CONNECT event. */
+        schedule_advertising();
         break;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -316,10 +408,30 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         struct ble_gap_conn_desc desc;
         int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
         if (rc == 0) {
-            ble_store_util_delete_peer(&desc.peer_id_addr);
+            log_connection_state("Peer requested fresh pairing", &desc);
+            rc = ble_store_util_delete_peer(&desc.peer_id_addr);
         }
+        if (rc != 0) {
+            ESP_LOGW(TAG, "Replacing peer bond failed: rc=%d (0x%x)", rc, (unsigned)rc);
+            return BLE_GAP_REPEAT_PAIRING_IGNORE;
+        }
+        log_bond_count("re-pairing");
         return BLE_GAP_REPEAT_PAIRING_RETRY;
     }
+
+    case BLE_GAP_EVENT_IDENTITY_RESOLVED: {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->identity_resolved.conn_handle, &desc) == 0) {
+            log_connection_state("Peer identity resolved", &desc);
+        }
+        break;
+    }
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        ESP_LOGI(TAG, "Subscription: handle=%u attr=%u notify=%u indicate=%u",
+                 (unsigned)event->subscribe.conn_handle, (unsigned)event->subscribe.attr_handle,
+                 (unsigned)event->subscribe.cur_notify, (unsigned)event->subscribe.cur_indicate);
+        break;
 
     default:
         break;
@@ -355,15 +467,19 @@ static void hid_event_handler(void *handler_arg,
         break;
 
     case ESP_HIDD_CONTROL_EVENT:
-        s_suspended = data->control.control == 0;
-        ESP_LOGI(TAG, "HID %s", s_suspended ? "suspended" : "resumed");
+        if (data->control.control == 0) {
+            xEventGroupClearBits(s_mouse_events, MOUSE_HOST_ACTIVE_BIT);
+            ESP_LOGI(TAG, "HID suspended");
+        } else {
+            xEventGroupSetBits(s_mouse_events, MOUSE_HOST_ACTIVE_BIT);
+            ESP_LOGI(TAG, "HID resumed");
+        }
         break;
 
     case ESP_HIDD_DISCONNECT_EVENT:
-        xEventGroupClearBits(s_mouse_events, MOUSE_READY_BIT);
-        s_suspended = false;
-        ESP_LOGI(TAG, "HID host disconnected; returning to pairing mode");
-        schedule_advertising();
+        /* GAP already cleared state and scheduled advertising. This queued HID
+         * event can arrive late; never clear a newer connection's ready bits. */
+        ESP_LOGI(TAG, "HID host disconnected");
         break;
 
     default:
@@ -417,6 +533,8 @@ void app_main(void)
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_store_config_init();
+    ESP_LOGI(TAG, "Reset reason=%d; reconnect recovery enabled", (int)esp_reset_reason());
+    log_bond_count("boot");
 
     ESP_ERROR_CHECK(esp_hidd_dev_init(&s_hid_config,
                                       ESP_HID_TRANSPORT_BLE,
